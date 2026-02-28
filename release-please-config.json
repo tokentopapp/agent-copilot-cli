@@ -5,12 +5,6 @@
       "release-type": "node",
       "include-component-in-tag": false,
       "draft": true,
-      "bootstrap-sha": "33e79b1fa943d90ab4df70dece914897c2489dad",
-      "release-type": "node",
-      "include-component-in-tag": false,
-      "draft": true,
-      "bump-minor-pre-major": true,
-      "bump-patch-for-minor-pre-major": false,
       "changelog-sections": [
         { "type": "feat", "section": "Features" },
         { "type": "fix", "section": "Bug Fixes" },
