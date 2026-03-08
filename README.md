@@ -17,20 +17,36 @@
 
 ## How It Works
 
-This plugin reads GitHub Copilot CLI's local session files from `~/.copilot/session-state/` to extract:
+This plugin reads GitHub Copilot CLI's local session files from `~/.copilot/session-state/` and process logs from `~/.copilot/logs/` to extract:
 
 - Session metadata (start time, project path, summary)
-- Token usage per message (estimated from content length; real data when available)
-- Model information per conversation turn via `session.model_change` timeline
+- Token usage per message (estimated from CompactionProcessor deltas in process logs; real `assistant.usage` data when available)
+- Model identification from any event's `data.model` field — no hardcoded model list required
 - Real-time file watching for live session updates
 
-### Token Data Limitations
+### Token Estimation
 
-Copilot CLI currently marks all token-bearing events (`assistant.usage`, `session.shutdown`) as **ephemeral**, meaning they are tracked in-memory for the `/usage` command but never written to `events.jsonl`. As a result, token counts are **estimated** from response content length (~4 chars/token). The plugin is structured to automatically use real token data (including cache read/write breakdown) when Copilot CLI begins persisting `assistant.usage` events. See [copilot-cli#1152](https://github.com/github/copilot-cli/issues/1152).
+Copilot CLI marks token-bearing events (`assistant.usage`, `session.shutdown`) as **ephemeral** — they're tracked in-memory for the `/usage` command but never written to `events.jsonl` (see [copilot-cli#1152](https://github.com/github/copilot-cli/issues/1152)). To work around this, the plugin parses **CompactionProcessor** entries from process logs (`~/.copilot/logs/process-*.log`), which report the running token count of the conversation context before each model request.
+
+Token estimation uses a priority chain:
+
+1. **Real usage data** — `assistant.usage` events (used automatically if Copilot CLI begins persisting them)
+2. **CompactionProcessor deltas** — input tokens from the CP entry, output tokens from the delta between consecutive entries
+3. **Content-length fallback** — `content.length / 4` heuristic (last resort when no process log is available)
+
+Each process log maps 1:1 to a session via the `Workspace initialized: {session-uuid}` line. The compaction index is built once and cached for 60 seconds.
 
 ### Model Tracking
 
-The plugin builds a timeline from `session.model_change` events and resolves the correct model for each message based on its timestamp. If a user switches models mid-session, each model appears as a separate entry — matching the behavior of the Claude Code and OpenCode plugins.
+The plugin identifies models generically by scanning **all** event types for a `data.model` field — no hardcoded model names or event types. This means new models (e.g. `gpt-5.3-codex`) are picked up automatically without code changes. The resolution priority is:
+
+1. `assistant.message` → `data.model`
+2. `session.model_change` timeline (timestamp-based)
+3. Any event with `data.model` (e.g. `tool.execution_complete`)
+4. Process log `Using default model:` line
+5. `'unknown'`
+
+If a user switches models mid-session, each model segment appears as a separate entry — matching the behavior of the Claude Code and OpenCode plugins.
 
 ## Install
 
@@ -50,7 +66,7 @@ bun add @tokentop/agent-copilot-cli
 
 | Type | Access | Paths |
 |------|--------|-------|
-| Filesystem | Read | `~/.copilot` |
+| Filesystem | Read | `~/.copilot/session-state/`, `~/.copilot/logs/` |
 
 ## Development
 
