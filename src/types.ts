@@ -173,3 +173,19 @@ export interface SessionAggregateCacheEntry {
   usageRows: SessionUsageData[];
   lastAccessed: number;
 }
+
+// ---------------------------------------------------------------------------
+// CompactionProcessor data from process logs
+// ---------------------------------------------------------------------------
+
+export interface CompactionEntry {
+  timestamp: number;
+  tokens: number;
+  contextWindow: number;
+}
+
+export interface ProcessLogData {
+  sessionId: string | null;
+  model: string | null;
+  compactionTimeline: CompactionEntry[];
+}

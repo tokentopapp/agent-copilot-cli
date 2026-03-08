@@ -5,7 +5,7 @@ import {
   isModelChange,
   parseSessionDirRows,
 } from '../src/parser.ts';
-import { toTimestamp, estimateTokens } from '../src/utils.ts';
+import { toTimestamp, estimateTokens, parseProcessLogData } from '../src/utils.ts';
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -65,6 +65,26 @@ function makeModelChange(overrides?: {
     data: {
       newModel: overrides?.newModel ?? 'claude-opus-4.6-fast',
       ...(overrides?.previousModel ? { previousModel: overrides.previousModel } : {}),
+    },
+  };
+}
+
+function makeToolExecutionComplete(overrides?: {
+  model?: string;
+  toolCallId?: string;
+  timestamp?: string;
+}): Record<string, unknown> {
+  return {
+    type: 'tool.execution_complete',
+    id: 'evt-tool',
+    timestamp: overrides?.timestamp ?? '2026-02-27T20:59:10.000Z',
+    parentId: null,
+    data: {
+      toolCallId: overrides?.toolCallId ?? 'call_abc123',
+      ...(overrides?.model !== undefined ? { model: overrides.model } : {}),
+      interactionId: 'interaction-001',
+      success: true,
+      result: { content: 'done' },
     },
   };
 }
@@ -473,5 +493,237 @@ describe('parseSessionDirRows', () => {
 
     const rows = await parseSessionDirRows(dir, MTIME, DEFAULT_MODEL);
     expect(rows[0]!.modelId).toBe('gpt-5.1');
+  });
+
+  test('extracts model from tool.execution_complete when no model_change or assistant model', async () => {
+    const dir = await createTempSession([
+      makeSessionStart(),
+      makeToolExecutionComplete({ model: 'gpt-5.3-codex' }),
+      makeAssistantMessage(),
+    ]);
+
+    const rows = await parseSessionDirRows(dir, MTIME, DEFAULT_MODEL);
+    expect(rows[0]!.modelId).toBe('gpt-5.3-codex');
+  });
+
+  test('model_change events take priority over tool.execution_complete model', async () => {
+    const dir = await createTempSession([
+      makeSessionStart({ timestamp: '2026-02-27T20:00:00.000Z' }),
+      makeToolExecutionComplete({ model: 'gpt-5.3-codex', timestamp: '2026-02-27T20:00:05.000Z' }),
+      makeModelChange({ newModel: 'claude-opus-4.6-fast', timestamp: '2026-02-27T20:00:10.000Z' }),
+      makeAssistantMessage({ timestamp: '2026-02-27T20:01:00.000Z' }),
+    ]);
+
+    const rows = await parseSessionDirRows(dir, MTIME, DEFAULT_MODEL);
+    expect(rows[0]!.modelId).toBe('claude-opus-4.6-fast');
+  });
+
+  test('assistant.message data.model takes priority over tool.execution_complete model', async () => {
+    const dir = await createTempSession([
+      makeSessionStart(),
+      makeToolExecutionComplete({ model: 'gpt-5.3-codex' }),
+      makeAssistantMessage({ model: 'o4-mini' }),
+    ]);
+
+    const rows = await parseSessionDirRows(dir, MTIME, DEFAULT_MODEL);
+    expect(rows[0]!.modelId).toBe('o4-mini');
+  });
+
+  test('picks up arbitrary future model names from events without code changes', async () => {
+    const dir = await createTempSession([
+      makeSessionStart(),
+      // Simulate a future event type that carries a model field
+      {
+        type: 'some.future_event',
+        id: 'evt-future',
+        timestamp: '2026-02-27T20:59:10.000Z',
+        parentId: null,
+        data: { model: 'gemini-ultra-3-preview', someOtherField: true },
+      },
+      makeAssistantMessage(),
+    ]);
+
+    const rows = await parseSessionDirRows(dir, MTIME, DEFAULT_MODEL);
+    expect(rows[0]!.modelId).toBe('gemini-ultra-3-preview');
+  });
+
+  test('falls back to defaultModel when no event carries a model field', async () => {
+    const dir = await createTempSession([
+      makeSessionStart(),
+      makeAssistantMessage(),
+    ]);
+
+    const rows = await parseSessionDirRows(dir, MTIME, DEFAULT_MODEL);
+    expect(rows[0]!.modelId).toBe(DEFAULT_MODEL);
+  });
+
+  // -------------------------------------------------------------------------
+  // CompactionProcessor-based token estimation
+  // -------------------------------------------------------------------------
+
+  test('uses compaction deltas for token estimation when timeline is provided', async () => {
+    const dir = await createTempSession([
+      makeSessionStart({ timestamp: '2026-02-27T20:58:52.000Z' }),
+      makeAssistantMessage({ messageId: 'msg_001', content: 'First', timestamp: '2026-02-27T20:59:00.000Z' }),
+      makeAssistantMessage({ messageId: 'msg_002', content: 'Second', timestamp: '2026-02-27T21:00:00.000Z' }),
+      makeAssistantMessage({ messageId: 'msg_003', content: 'Third response with more text', timestamp: '2026-02-27T21:01:00.000Z' }),
+    ]);
+
+    const compactionTimeline = [
+      { timestamp: Date.parse('2026-02-27T20:58:55.000Z'), tokens: 17844, contextWindow: 272000 },
+      { timestamp: Date.parse('2026-02-27T20:59:30.000Z'), tokens: 19744, contextWindow: 272000 },
+      { timestamp: Date.parse('2026-02-27T21:00:30.000Z'), tokens: 36386, contextWindow: 272000 },
+    ];
+
+    const rows = await parseSessionDirRows(dir, MTIME, DEFAULT_MODEL, compactionTimeline);
+    expect(rows).toHaveLength(3);
+
+    // Sort by timestamp to match compaction order
+    rows.sort((a, b) => a.timestamp - b.timestamp);
+
+    // Message 0: input = CP[0].tokens, output = CP[1] - CP[0]
+    expect(rows[0]!.tokens.input).toBe(17844);
+    expect(rows[0]!.tokens.output).toBe(19744 - 17844); // 1900
+
+    // Message 1: input = CP[1].tokens, output = CP[2] - CP[1]
+    expect(rows[1]!.tokens.input).toBe(19744);
+    expect(rows[1]!.tokens.output).toBe(36386 - 19744); // 16642
+
+    // Message 2: input = CP[2].tokens, output = content estimate (no CP[3])
+    expect(rows[2]!.tokens.input).toBe(36386);
+    expect(rows[2]!.tokens.output).toBe(estimateTokens('Third response with more text'));
+  });
+
+  test('compaction data does not override real usage data from assistant.usage', async () => {
+    const dir = await createTempSession([
+      makeSessionStart(),
+      makeAssistantMessage({
+        content: 'response',
+        usage: { prompt_tokens: 5000, completion_tokens: 500 },
+      }),
+    ]);
+
+    const compactionTimeline = [
+      { timestamp: Date.parse('2026-02-27T20:58:55.000Z'), tokens: 17844, contextWindow: 272000 },
+    ];
+
+    const rows = await parseSessionDirRows(dir, MTIME, DEFAULT_MODEL, compactionTimeline);
+    // Real usage data takes precedence
+    expect(rows[0]!.tokens.input).toBe(5000);
+    expect(rows[0]!.tokens.output).toBe(500);
+  });
+
+  test('falls back to content estimation when no compaction data', async () => {
+    const dir = await createTempSession([
+      makeSessionStart(),
+      makeAssistantMessage({ content: 'Hello world response' }),
+    ]);
+
+    // No compaction timeline passed
+    const rows = await parseSessionDirRows(dir, MTIME, DEFAULT_MODEL);
+    expect(rows[0]!.tokens.output).toBe(estimateTokens('Hello world response'));
+    expect(rows[0]!.tokens.input).toBe(Math.ceil(rows[0]!.tokens.output * 0.5));
+  });
+
+  test('handles more messages than compaction entries gracefully', async () => {
+    const dir = await createTempSession([
+      makeSessionStart({ timestamp: '2026-02-27T20:58:52.000Z' }),
+      makeAssistantMessage({ messageId: 'msg_001', content: 'First', timestamp: '2026-02-27T20:59:00.000Z' }),
+      makeAssistantMessage({ messageId: 'msg_002', content: 'Second reply', timestamp: '2026-02-27T21:00:00.000Z' }),
+    ]);
+
+    // Only 1 CP entry for 2 messages
+    const compactionTimeline = [
+      { timestamp: Date.parse('2026-02-27T20:58:55.000Z'), tokens: 23000, contextWindow: 128000 },
+    ];
+
+    const rows = await parseSessionDirRows(dir, MTIME, DEFAULT_MODEL, compactionTimeline);
+    rows.sort((a, b) => a.timestamp - b.timestamp);
+
+    // First message gets CP data (input from CP, output = content estimate since no CP[1])
+    expect(rows[0]!.tokens.input).toBe(23000);
+    expect(rows[0]!.tokens.output).toBe(estimateTokens('First'));
+
+    // Second message keeps content-based estimate (no CP entry for it)
+    expect(rows[1]!.tokens.output).toBe(estimateTokens('Second reply'));
+    expect(rows[1]!.tokens.input).toBe(Math.ceil(rows[1]!.tokens.output * 0.5));
+  });
+
+  test('handles empty compaction timeline same as no timeline', async () => {
+    const dir = await createTempSession([
+      makeSessionStart(),
+      makeAssistantMessage({ content: 'test response' }),
+    ]);
+
+    const rows = await parseSessionDirRows(dir, MTIME, DEFAULT_MODEL, []);
+    expect(rows[0]!.tokens.output).toBe(estimateTokens('test response'));
+    expect(rows[0]!.tokens.input).toBe(Math.ceil(rows[0]!.tokens.output * 0.5));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseProcessLogData
+// ---------------------------------------------------------------------------
+
+describe('parseProcessLogData', () => {
+  test('extracts session ID from Workspace initialized line', () => {
+    const content = '2026-03-08T21:52:39.810Z [INFO] Workspace initialized: 65d544b4-d7b2-4cc5-91a4-e545607b6135 (checkpoints: 0)\n';
+    const result = parseProcessLogData(content);
+    expect(result.sessionId).toBe('65d544b4-d7b2-4cc5-91a4-e545607b6135');
+  });
+
+  test('extracts model from Using default model line', () => {
+    const content = '2026-02-27T20:33:02.160Z [INFO] Using default model: claude-sonnet-4.6\n';
+    const result = parseProcessLogData(content);
+    expect(result.model).toBe('claude-sonnet-4.6');
+  });
+
+  test('extracts CompactionProcessor timeline entries', () => {
+    const content = [
+      '2026-03-08T21:52:54.209Z [INFO] CompactionProcessor: Utilization 6.6% (17844/272000 tokens) below threshold 80%',
+      '2026-03-08T21:53:01.324Z [INFO] CompactionProcessor: Utilization 7.3% (19744/272000 tokens) below threshold 80%',
+      '2026-03-08T21:53:06.343Z [INFO] CompactionProcessor: Utilization 13.4% (36386/272000 tokens) below threshold 80%',
+    ].join('\n');
+
+    const result = parseProcessLogData(content);
+    expect(result.compactionTimeline).toHaveLength(3);
+    expect(result.compactionTimeline[0]).toEqual({
+      timestamp: Date.parse('2026-03-08T21:52:54.209Z'),
+      tokens: 17844,
+      contextWindow: 272000,
+    });
+    expect(result.compactionTimeline[2]!.tokens).toBe(36386);
+  });
+
+  test('parses a complete process log with all fields', () => {
+    const content = [
+      '2026-03-08T21:52:39.810Z [INFO] Workspace initialized: abcd1234-5678-9012-3456-789012345678 (checkpoints: 0)',
+      '2026-03-08T21:52:39.819Z [INFO] Starting Copilot CLI: 0.0.420',
+      '2026-03-08T21:52:40.000Z [INFO] Using default model: gpt-5.3-codex',
+      '2026-03-08T21:52:54.209Z [INFO] CompactionProcessor: Utilization 6.6% (17844/272000 tokens) below threshold 80%',
+      '2026-03-08T21:53:01.324Z [INFO] CompactionProcessor: Utilization 7.3% (19744/272000 tokens) below threshold 80%',
+    ].join('\n');
+
+    const result = parseProcessLogData(content);
+    expect(result.sessionId).toBe('abcd1234-5678-9012-3456-789012345678');
+    expect(result.model).toBe('gpt-5.3-codex');
+    expect(result.compactionTimeline).toHaveLength(2);
+  });
+
+  test('returns nulls for log without session or model data', () => {
+    const content = '2026-03-08T21:52:39.819Z [INFO] Starting Copilot CLI: 0.0.420\n';
+    const result = parseProcessLogData(content);
+    expect(result.sessionId).toBeNull();
+    expect(result.model).toBeNull();
+    expect(result.compactionTimeline).toHaveLength(0);
+  });
+
+  test('returns last model when multiple Using default model lines exist', () => {
+    const content = [
+      '2026-02-27T20:33:02.160Z [INFO] Using default model: claude-sonnet-4.6',
+      '2026-02-27T20:33:25.853Z [INFO] Using default model: claude-sonnet-4.6',
+    ].join('\n');
+    const result = parseProcessLogData(content);
+    expect(result.model).toBe('claude-sonnet-4.6');
   });
 });

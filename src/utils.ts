@@ -1,5 +1,5 @@
 import * as fs from 'fs/promises';
-import type { CopilotCliWorkspaceInfo } from './types.ts';
+import type { CopilotCliWorkspaceInfo, ProcessLogData } from './types.ts';
 
 /**
  * Read a JSONL file and return an array of parsed lines.
@@ -109,4 +109,47 @@ export function toTimestamp(value: string | undefined, fallback: number): number
   if (!value) return fallback;
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+const RE_WORKSPACE_INIT = /Workspace initialized: ([0-9a-f-]{36})/;
+const RE_DEFAULT_MODEL = /\[INFO\] Using default model: (.+)/;
+const RE_COMPACTION = /^(\d{4}-\d{2}-\d{2}T[\d:.]+Z) \[INFO\] CompactionProcessor: Utilization [\d.]+% \((\d+)\/(\d+) tokens\)/;
+
+/**
+ * Parse a Copilot CLI process log file and extract session ID, model, and
+ * CompactionProcessor timeline. Pure function — no I/O.
+ */
+export function parseProcessLogData(content: string): ProcessLogData {
+  const lines = content.split(/\r?\n/);
+  let sessionId: string | null = null;
+  let model: string | null = null;
+  const compactionTimeline: ProcessLogData['compactionTimeline'] = [];
+
+  for (const line of lines) {
+    if (!sessionId) {
+      const wsMatch = RE_WORKSPACE_INIT.exec(line);
+      if (wsMatch) {
+        sessionId = wsMatch[1]!;
+      }
+    }
+
+    const modelMatch = RE_DEFAULT_MODEL.exec(line);
+    if (modelMatch) {
+      model = modelMatch[1]!.trim();
+    }
+
+    const cpMatch = RE_COMPACTION.exec(line);
+    if (cpMatch) {
+      const ts = Date.parse(cpMatch[1]!);
+      if (Number.isFinite(ts)) {
+        compactionTimeline.push({
+          timestamp: ts,
+          tokens: parseInt(cpMatch[2]!, 10),
+          contextWindow: parseInt(cpMatch[3]!, 10),
+        });
+      }
+    }
+  }
+
+  return { sessionId, model, compactionTimeline };
 }

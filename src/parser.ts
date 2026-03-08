@@ -3,8 +3,8 @@ import * as path from 'path';
 import type { AgentFetchContext, SessionParseOptions, SessionUsageData } from '@tokentop/plugin-sdk';
 import { CACHE_TTL_MS, evictSessionAggregateCache, sessionAggregateCache, sessionCache, sessionMetadataIndex } from './cache.ts';
 import { COPILOT_CLI_LOGS_PATH, COPILOT_CLI_SESSION_STATE_PATH, getSessionDirs } from './paths.ts';
-import type { CopilotCliAssistantMessageEvent, CopilotCliEventBase, CopilotCliSessionModelChangeEvent, CopilotCliSessionStartEvent } from './types.ts';
-import { estimateTokens, extractModelFromProcessLog, readJsonlFile, readWorkspaceYaml, toTimestamp } from './utils.ts';
+import type { CompactionEntry, CopilotCliAssistantMessageEvent, CopilotCliEventBase, CopilotCliSessionModelChangeEvent, CopilotCliSessionStartEvent } from './types.ts';
+import { estimateTokens, extractModelFromProcessLog, parseProcessLogData, readJsonlFile, readWorkspaceYaml, toTimestamp } from './utils.ts';
 import {
   consumeForceFullReconciliation,
   sessionWatcher,
@@ -22,6 +22,10 @@ interface ParsedSessionDir {
 let cachedModel: string | null = null;
 let modelCacheTime = 0;
 const MODEL_CACHE_TTL_MS = 60_000;
+
+/** Cached compaction index: sessionId → CompactionEntry[]. */
+let compactionIndexCache: Map<string, CompactionEntry[]> | null = null;
+let compactionIndexTime = 0;
 
 /**
  * Get the default model from process logs, with 60s caching.
@@ -61,6 +65,42 @@ async function getDefaultModel(): Promise<string> {
   }
 
   return cachedModel ?? 'unknown';
+}
+
+/**
+ * Build an index mapping sessionId → CompactionProcessor timeline.
+ * Scans all process logs in ~/.copilot/logs/ and caches for 60s.
+ */
+async function buildCompactionIndex(): Promise<Map<string, CompactionEntry[]>> {
+  const now = Date.now();
+  if (compactionIndexCache && now - compactionIndexTime < MODEL_CACHE_TTL_MS) {
+    return compactionIndexCache;
+  }
+
+  const index = new Map<string, CompactionEntry[]>();
+
+  try {
+    const entries = await fs.readdir(COPILOT_CLI_LOGS_PATH, { withFileTypes: true });
+
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.startsWith('process-') || !entry.name.endsWith('.log')) continue;
+      try {
+        const content = await fs.readFile(path.join(COPILOT_CLI_LOGS_PATH, entry.name), 'utf-8');
+        const logData = parseProcessLogData(content);
+        if (logData.sessionId && logData.compactionTimeline.length > 0) {
+          index.set(logData.sessionId, logData.compactionTimeline);
+        }
+      } catch {
+        // Skip unreadable files
+      }
+    }
+  } catch {
+    // No logs directory
+  }
+
+  compactionIndexCache = index;
+  compactionIndexTime = now;
+  return index;
 }
 
 /**
@@ -142,6 +182,7 @@ export async function parseSessionDirRows(
   dirPath: string,
   mtimeMs: number,
   defaultModel: string,
+  compactionTimeline?: ReadonlyArray<CompactionEntry>,
 ): Promise<SessionUsageData[]> {
   const eventsPath = path.join(dirPath, 'events.jsonl');
   const workspacePath = path.join(dirPath, 'workspace.yaml');
@@ -169,6 +210,19 @@ export async function parseSessionDirRows(
   }
   // Sort ascending by time so binary-style lookup works
   modelChanges.sort((a, b) => a.timestamp - b.timestamp);
+
+  // Extract model from ANY event that carries a data.model field (e.g. tool.execution_complete).
+  // This is model-name-agnostic — any future model string is picked up automatically.
+  let eventDerivedModel: string | null = null;
+  for (const event of events) {
+    const data = event.data as Record<string, unknown> | undefined;
+    if (data && typeof data === 'object' && typeof data.model === 'string' && data.model.length > 0) {
+      eventDerivedModel = data.model;
+    }
+  }
+
+  // Priority: assistant.message data.model > model_change timeline > event-derived model > process log default
+  const effectiveDefaultModel = eventDerivedModel ?? defaultModel;
 
   // Process assistant messages
   for (const event of events) {
@@ -201,7 +255,7 @@ export async function parseSessionDirRows(
       inputTokens = Math.ceil(outputTokens * 0.5);
     }
 
-    const modelId = data.model ?? resolveModelAtTime(toTimestamp(event.timestamp, mtimeMs), defaultModel, modelChanges);
+    const modelId = data.model ?? resolveModelAtTime(toTimestamp(event.timestamp, mtimeMs), effectiveDefaultModel, modelChanges);
 
     const usage: SessionUsageData = {
       sessionId,
@@ -232,7 +286,33 @@ export async function parseSessionDirRows(
     deduped.set(data.messageId, usage);
   }
 
-  return Array.from(deduped.values());
+  const rows = Array.from(deduped.values());
+
+  // Enhance token estimates using CompactionProcessor data from process logs.
+  // CP entries fire 1:1 with model requests — matched by chronological order.
+  // This replaces the content-length heuristic (~4 chars/token) with real token
+  // counts from the CLI's internal tokenizer.
+  if (compactionTimeline && compactionTimeline.length > 0 && rows.length > 0) {
+    rows.sort((a, b) => a.timestamp - b.timestamp);
+
+    for (let i = 0; i < rows.length && i < compactionTimeline.length; i++) {
+      const row = rows[i]!;
+      const cp = compactionTimeline[i]!;
+
+      // Only override estimated data — never clobber real usage from assistant.usage events
+      if (!row.metadata?.isEstimated) continue;
+
+      row.tokens.input = cp.tokens;
+
+      if (i + 1 < compactionTimeline.length) {
+        const delta = compactionTimeline[i + 1]!.tokens - cp.tokens;
+        row.tokens.output = Math.max(0, delta);
+      }
+      // For the last message: keep content-based output estimate (no next CP entry)
+    }
+  }
+
+  return rows;
 }
 
 /**
@@ -283,6 +363,7 @@ export async function parseSessionsFromDirs(
 
   const discoveredDirs = await getSessionDirs();
   const defaultModel = await getDefaultModel();
+  const compactionIndex = await buildCompactionIndex();
 
   for (const sessionDirPath of discoveredDirs) {
     watchSessionDir(sessionDirPath);
@@ -368,7 +449,8 @@ export async function parseSessionsFromDirs(
 
     aggregateCacheMisses++;
 
-    const usageRows = await parseSessionDirRows(dir.dirPath, dir.mtimeMs, defaultModel);
+    const timeline = compactionIndex.get(dir.sessionId);
+    const usageRows = await parseSessionDirRows(dir.dirPath, dir.mtimeMs, defaultModel, timeline);
 
     sessionAggregateCache.set(dir.sessionId, {
       updatedAt: dir.mtimeMs,
